@@ -1,55 +1,153 @@
-# X-ray Classification with Adversarial Attacks and Optimized Compression
+# GA-AC: Recovering Medical Images from Adversarial Attacks
 
-This project implements a pipeline for classifying X-ray images using a Convolutional Neural Network (CNN). The workflow includes:
+Code for the paper **"Recovering Medical Images from Adversarial Attacks: Genetic Algorithm-based Adaptive Compression (GA-AC)"**, published at SBSeg 2025.
 
-- **Data Loading and Preprocessing**: Images are read in grayscale and normalized.
-- **Model Definition**: A CNN is defined to classify the images into 3 categories (NORMAL, VIRAL, BACTERIAL).
-- **Model Evaluation**: The model is evaluated before and after applying adversarial attacks.
-- **Adversarial Attack**: The FGSM technique is used to create adversarial images.
-- **Genetic Algorithm Optimization**: A function optimizes image compression to restore quality.
-- **Results Visualization**: Confusion matrices are displayed before and after the attack and recovery.
+The pipeline:
 
-## Project Structure
+1. Trains a small CNN to classify chest X-rays (grayscale, 128×128) into **NORMAL**, **VIRAL** and **BACTERIAL** pneumonia.
+2. Attacks the test images with **FGSM** (Fast Gradient Sign Method).
+3. For each attacked image, runs a **genetic algorithm** (DEAP) that searches for the recovery transformation (rotation, scaling, brightness, contrast and **PNG** or **WebP** compression) maximizing PSNR, SSIM and the classifier's confidence.
+4. Evaluates the four scenarios of the paper (Baseline, Adversarial, PNG Recovery, WebP Recovery) with accuracy, precision, recall, F1-score and confusion matrices.
 
-- **script.py**: Main script that executes the complete pipeline.
-- **chest_xray/train**: Directory containing the dataset, organized into subfolders:
-  - **NORMAL**: X-ray images without pneumonia.
-  - **PNEUMONIA**: X-ray images with pneumonia.  
-    *Note: File names must contain the words "virus" or "bacteria" to differentiate the pneumonia types.*
-- **genetic_compression.py**: Module containing the `run_ga` function for compression optimization.
-- **attacks.py**: Module containing the `fgsm_attack` function for applying the adversarial attack.
+In the paper, WebP-based recovery brought the F1-score from **24.14%** (under attack) back to **98.10%**.
+## Repository structure
 
-## Requirements
+| File | Content |
+|---|---|
+| `dataset.py` | Dataset loading, NORMAL/VIRAL/BACTERIAL labeling, train/val split |
+| `model.py` | CNN (`XRayCNN`), checkpoint save/load, prediction helpers |
+| `train.py` | Trains the CNN and saves the weights to `weights/cnn_xray.pth` |
+| `attack.py` | `fgsm_attack(model, images, labels, epsilon)` |
+| `genetic_compression.py` | GA-AC: chromosome, recovery transformations, fitness and `run_ga(...)` |
+| `adversarial_experiment.py` | Runs the four scenarios on the test set and saves the results |
+| `weights/` | Model weights (`cnn_xray.pth`) and training metadata (`cnn_xray.json`) |
 
-- **Python**: Version 3.7 or later.
-- **Python Libraries**:
-  - numpy
-  - opencv-python (cv2)
-  - torch
-  - torchvision
-  - matplotlib
-  - scikit-learn
+## Quick start
 
-*Note: Ensure that the `genetic_compression.py` and `attacks.py` modules are implemented and located in the same directory as the script or accessible via PYTHONPATH.*
+```bash
+# 1. Install
+git clone https://github.com/paulovitorcl/adversarial-recover-ga-ac.git
+cd adversarial-recover-ga-ac
+python -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 
-## Installation
+# 2. Download the dataset into chest_xray/ (see "Dataset")
 
-1. **Clone the repository**:
+# 3. Train the classifier -> weights/cnn_xray.pth
+python train.py
+
+# 4. Run the experiment -> results/
+python adversarial_experiment.py
+```
+
+Python 3.9+ is required. A GPU (CUDA) or Apple Silicon (MPS) is used automatically when available (`--device auto`).
+
+## Dataset
+
+The experiments use the public [Chest X-Ray Images (Pneumonia)](https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia) dataset.
+
+1. Download it from Kaggle (web UI, or with the [Kaggle CLI](https://github.com/Kaggle/kaggle-api)):
    ```bash
-   git clone <REPOSITORY_URL>
-   cd <REPOSITORY_DIRECTORY>
+   kaggle datasets download -d paultimothymooney/chest-xray-pneumonia
+   unzip chest-xray-pneumonia.zip
+   ```
+   The zip also contains a duplicated `chest_xray/chest_xray/` folder and a `__MACOSX/` folder; you can delete both.
 
-2. **Virtual environment**:
-   ```bash
-    python -m venv venv
-    source venv/bin/activate  # Linux/Mac
-    venv\Scripts\activate     # Windows
+2. Keep the `chest_xray/` folder at the repository root:
+   ```
+   chest_xray/
+   ├── train/   (NORMAL/, PNEUMONIA/)  -> split 80% train / 20% validation
+   ├── val/     (not used, only 16 images)
+   └── test/    (NORMAL/, PNEUMONIA/)  -> used in the experiment
+   ```
 
-3. **Install the dependencies**:
-   ```bash
-    pip install numpy opencv-python torch torchvision matplotlib scikit-learn
+The dataset only has `NORMAL` and `PNEUMONIA` folders. The pneumonia type comes from the file name: `person1_virus_6.jpeg` → **VIRAL**, `person1_bacteria_1.jpeg` → **BACTERIAL**. The test set has 234 normal, 148 viral and 242 bacterial images.
 
-## Script Execution
+## Model weights
 
-   ```bash
-   python adversarial_experiment.py
+The CNN weights are generated by `train.py` and stored in `weights/`:
+
+| File | Content |
+|---|---|
+| `weights/cnn_xray.pth` | Checkpoint: `state_dict`, class names, training configuration, history and test metrics (~17 MB, ~4.2M parameters) |
+| `weights/cnn_xray.json` | The same metadata in readable form |
+
+```bash
+python train.py                     # defaults = paper configuration
+python train.py --device cpu --epochs 10 --out weights/cnn_xray.pth
+```
+
+Training runs for 10 epochs and keeps the epoch with the best validation F1.
+
+Loading the weights in your own code:
+
+```python
+from model import load_model, predict_proba
+model = load_model("weights/cnn_xray.pth", device="cpu")
+probs = predict_proba(model, images_uint8, device="cpu")   # images_uint8: (N, 128, 128)
+```
+
+## Running the experiment
+
+```bash
+python adversarial_experiment.py                         # full test set, PNG and WebP
+python adversarial_experiment.py --limit 50              # quick run on 50 random test images
+python adversarial_experiment.py --formats webp --epsilon 0.05
+python adversarial_experiment.py --fitness-weights 1 1 0 # label-free GA (PSNR + SSIM only)
+```
+
+GA-AC runs one GA **per image** (≈1,000 fitness evaluations each), so the full test set with both formats takes a while; use `--limit` while developing.
+
+Outputs in `results/`:
+
+| File | Content |
+|---|---|
+| `metrics.json` | Accuracy, precision, recall and F1 (macro) for each scenario, plus the run configuration |
+| `confusion_matrix_<scenario>.pdf` | Confusion matrix of each scenario |
+| `recovery_params_<format>.csv` | Best configuration found for each image (quality, rotation, scale, brightness, contrast), its PSNR/SSIM/confidence and time |
+| `examples.png` | One image per class: original, attacked and recovered (as in Figure 5 of the paper) |
+
+## Method details
+
+| Item | Value |
+|---|---|
+| Classifier | Small CNN based on Kesim et al. (EBBT 2019): 3 conv layers (32/64/128 filters, 3×3, ReLU, max-pool) + 2 dense layers (128 → 3), softmax output |
+| Input | Grayscale, 128×128, pixels in [0, 1]; normalization (mean 0.5, std 0.5) is done inside the model |
+| Training | 10 epochs, Adam (lr = 0.001), batch size 32, augmentation with horizontal flip and contrast jitter, seed 42 |
+| Attack | FGSM, ε = 0.03 in [0, 1] pixel space (~7.7 gray levels); attacked images are quantized to 8 bits |
+| GA | Population 50, 25 generations, `cxBlend` (rate 0.7), `mutGaussian` (rate 0.2), tournament selection (size 3), elitism (2) |
+| Recovery formats | PNG and WebP, each evaluated as a separate scenario |
+
+**Chromosome.** Five genes in [0, 1], decoded in `genetic_compression.decode()`:
+
+| Gene | Range |
+|---|---|
+| quality | WebP quality 1–100, or PNG compression level 0–9 |
+| rotation | 0°, 90°, 180°, 270° |
+| scale | 0.5–1.0 (downscale before compression, then upscale back) |
+| brightness | −50 to +50 |
+| contrast | 0.5–2.0 |
+
+Rotation and scaling are undone after compression, so they change how the compression grid lines up with the adversarial pattern without changing the image geometry. Since PNG is lossless, PNG recovery acts only through scaling, brightness and contrast.
+
+**Fitness.** Weighted sum of `PSNR/50` (capped at 50 dB), `SSIM` (both against the clean image) and the softmax probability of the true class. Weights are set with `--fitness-weights` (default `1 1 1`).
+
+## Notes for future work
+
+- The fitness uses the clean image (PSNR/SSIM) and the true label (classification term), which are only available in a controlled evaluation. A deployable defense needs a reference-free fitness. `--fitness-weights 1 1 0` drops the label, and the reference image would still need to be replaced (e.g. no-reference quality metrics).
+- Only FGSM is implemented. New attacks (PGD, Carlini-Wagner) can be added to `attack.py` with the same signature.
+- New transformations (denoising, blurring, etc.) can be added as genes in `GENES`, `decode()` and `apply_recovery()`.
+- Runtime is dominated by the per-image GA; batching individuals across images or parallelizing `run_ga` over images are the natural next steps.
+
+## Citation
+
+```bibtex
+@inproceedings{lima2025gaac,
+  author    = {Lima, Paulo Vitor C. and Quincozes, Silvio E. and do Nascimento, Marcelo Z. and Kazienko, Juliano F. and Welfer, Daniel and Nomura, Shigueo},
+  title     = {Recovering Medical Images from Adversarial Attacks: Genetic Algorithm-based Adaptive Compression ({GA-AC})},
+  booktitle = {Anais do Simp{\'o}sio Brasileiro de Seguran{\c{c}}a da Informa{\c{c}}{\~a}o e de Sistemas Computacionais (SBSeg)},
+  publisher = {Sociedade Brasileira de Computa{\c{c}}{\~a}o (SBC)},
+  year      = {2025}
+}
+```

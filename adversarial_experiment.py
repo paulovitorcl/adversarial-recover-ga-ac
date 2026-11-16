@@ -1,174 +1,140 @@
-import os
+"""Runs the four scenarios of the paper on the test set: Baseline, Adversarial (FGSM),
+PNG Recovery and WebP Recovery (GA-AC). Results are written to --out."""
+import argparse
+import csv
 import json
 import logging
-import numpy as np
-import cv2
-import torch
-import torchvision.transforms as transforms
-import torch.nn as nn
-import torch.optim as optim
+import os
+import random
+import time
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-from torch.utils.data import DataLoader, Dataset
-from genetic_compression import run_ga
-from attacks import fgsm_attack
+import numpy as np
+import torch
+from sklearn.metrics import (ConfusionMatrixDisplay, accuracy_score, confusion_matrix,
+                             precision_recall_fscore_support)
+
+from attack import fgsm_attack
+from dataset import CLASSES, list_samples, load_image, to_tensor, to_uint8
+from genetic_compression import FORMATS, GAConfig, run_ga
+from model import get_device, load_model, predict_proba, set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Custom dataset for X-rays
-class XRayDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.image_files = []
-        self.labels = []
-        
-        # Class mapping
-        self.class_map = {"NORMAL": 0, "VIRAL": 1, "BACTERIANO": 2}
-        
-        # Cycle through the NORMAL and PNEUMONIA subfolders
-        for label in ["NORMAL", "PNEUMONIA"]:
-            label_path = os.path.join(root_dir, label)
-            for img_name in os.listdir(label_path):
-                img_path = os.path.join(label_path, img_name)
-                
-                # Differentiate viral and bacterial pneumonia
-                if "virus" in img_name.lower():
-                    class_label = self.class_map["VIRAL"]
-                elif "bacteria" in img_name.lower():
-                    class_label = self.class_map["BACTERIANO"]
-                else:
-                    class_label = self.class_map["NORMAL"]
 
-                self.image_files.append(img_path)
-                self.labels.append(class_label)
-
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, idx):
-        img_path = self.image_files[idx]
-        image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)  # Lendo em escala de cinza
-        label = self.labels[idx]
-
-        # ✅ Check if the image was loaded correctly
-        if image is None:
-            logging.warning(f"Imagem não carregada: {img_path}. Pulando este arquivo.")
-            return self.__getitem__((idx + 1) % len(self.image_files))  # Pular para a próxima imagem
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, label
+def compute_metrics(labels, preds):
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average="macro", zero_division=0)
+    return {"accuracy": accuracy_score(labels, preds), "precision": precision, "recall": recall, "f1": f1}
 
 
-# Load dataset
-def load_data(data_path, batch_size=32):
-    transform = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((128, 128)),  # Aumentando a resolução
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5])  # Normalização para imagens em escala de cinza
-    ])
-    
-    dataset = XRayDataset(data_path, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    return dataloader
-
-# Define CNN model for X-rays
-def load_model():
-    model = nn.Sequential(
-        nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1),  # Mudança para 1 canal (raios-X)
-        nn.ReLU(),
-        nn.MaxPool2d(kernel_size=2, stride=2),
-        nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(),
-        nn.MaxPool2d(kernel_size=2, stride=2),
-        nn.Flatten(),
-        nn.Linear(128 * 32 * 32, 256),  # Ajustado para 128x128 entrada
-        nn.ReLU(),
-        nn.Linear(256, 3)  # 3 classes: NORMAL, VIRAL, BACTERIANO
-    )
-    return model
-
-# Classifier evaluation
-def evaluate_model(model, dataloader):
-    model.eval()
-    all_preds = []   
-    all_labels = []
-    
-    with torch.no_grad():
-        for images, labels in dataloader:
-            if images.ndim == 5:
-                images = images.squeeze(1)  
-
-            if images.ndim == 3:
-                images = images.unsqueeze(1)  
-
-            outputs = model(images)
-            _, preds = torch.max(outputs, 1)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    return np.array(all_preds), np.array(all_labels)
+def save_confusion_matrix(labels, preds, title, path):
+    cm = confusion_matrix(labels, preds, labels=range(len(CLASSES)))
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    ConfusionMatrixDisplay(cm, display_labels=CLASSES).plot(ax=ax, cmap="Blues", colorbar=False)
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
 
 
+def save_examples(images_by_scenario, labels, path):
+    """One row per class: original, attacked and recovered images (as in Figure 5 of the paper)."""
+    rows = [int(np.flatnonzero(labels == c)[0]) for c in range(len(CLASSES)) if np.any(labels == c)]
+    names = list(images_by_scenario)
+    fig, axes = plt.subplots(len(rows), len(names), figsize=(3 * len(names), 3 * len(rows)), squeeze=False)
+    for r, idx in enumerate(rows):
+        for c, name in enumerate(names):
+            axes[r, c].imshow(images_by_scenario[name][idx], cmap="gray", vmin=0, vmax=255)
+            axes[r, c].set_title(f"{name}\n{CLASSES[labels[idx]]}" if r == 0 else CLASSES[labels[idx]])
+            axes[r, c].axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
-# GA-optimized compression application
-def apply_compression(image, config):
-    formato, qualidade, rotacao, brilho, contraste = config
-    image = cv2.rotate(image, rotacao)
-    image = cv2.convertScaleAbs(image, alpha=contraste, beta=brilho * 50)
 
-    temp_path = f"temp.{formato}"
-    cv2.imwrite(temp_path, image, [cv2.IMWRITE_JPEG_QUALITY, qualidade])
-    image = cv2.imread(temp_path, cv2.IMREAD_GRAYSCALE)
-    os.remove(temp_path)
-    
-    return image
+def attack_images(model, images, labels, epsilon, device, batch_size=64):
+    adversarial = []
+    for start in range(0, len(images), batch_size):
+        batch = to_tensor(images[start:start + batch_size]).to(device)
+        targets = torch.as_tensor(labels[start:start + batch_size], device=device)
+        adversarial.append(to_uint8(fgsm_attack(model, batch, targets, epsilon)))
+    # Adversarial images are quantized to 8 bits, as they would be when stored or transmitted
+    return np.concatenate(adversarial)
+
 
 def main():
-    data_path = "./chest_xray/train"  # Caminho do dataset
-    dataloader = load_data(data_path)
-    model = load_model()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", default="chest_xray", help="Folder with the test/ subfolder")
+    parser.add_argument("--weights", default="weights/cnn_xray.pth")
+    parser.add_argument("--out", default="results")
+    parser.add_argument("--epsilon", type=float, default=0.03)
+    parser.add_argument("--formats", nargs="+", default=list(FORMATS), choices=FORMATS)
+    parser.add_argument("--limit", type=int, default=None, help="Use a random subset of N test images")
+    parser.add_argument("--pop-size", type=int, default=50)
+    parser.add_argument("--generations", type=int, default=25)
+    parser.add_argument("--cxpb", type=float, default=0.7)
+    parser.add_argument("--mutpb", type=float, default=0.2)
+    parser.add_argument("--fitness-weights", type=float, nargs=3, default=[1.0, 1.0, 1.0],
+                        metavar=("PSNR", "SSIM", "CLS"))
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto", help="auto, cpu, cuda or mps")
+    args = parser.parse_args()
 
-    # Initial assessment
-    logging.info("Avaliando modelo antes do ataque...")
-    preds_before, labels = evaluate_model(model, dataloader)
+    if not os.path.isfile(args.weights):
+        raise SystemExit(f"Weights not found at {args.weights}. Train the model first: python train.py")
 
-    # Application of adversarial attack
-    logging.info("Aplicando ataque adversarial...")
-    images_adv = [fgsm_attack(model, img, lbl, epsilon=0.03) for img, lbl in dataloader]
+    set_seed(args.seed)
+    device = get_device(args.device)
+    os.makedirs(args.out, exist_ok=True)
+    model = load_model(args.weights, device)
 
-    # Optimization with Genetic Algorithm
-    logging.info("Otimizando compressão com Algoritmo Genético...")
-    best_config = run_ga(images_adv, labels)
+    samples = list_samples(os.path.join(args.data, "test"))
+    if args.limit:
+        samples = random.Random(args.seed).sample(samples, min(args.limit, len(samples)))
+    originals = np.stack([load_image(path) for path, _ in samples])
+    labels = np.array([label for _, label in samples])
+    logging.info(f"Device: {device} | test images: {len(samples)}")
 
-    # Save best configuration
-    with open("best_compression.json", "w") as f:
-        json.dump(best_config, f)
+    images = {"Baseline": originals}
+    logging.info(f"Applying FGSM (epsilon={args.epsilon})...")
+    images["Adversarial"] = attack_images(model, originals, labels, args.epsilon, device)
 
-    logging.info(f"Melhor configuração encontrada: {best_config}")
+    ga_config = GAConfig(pop_size=args.pop_size, generations=args.generations, cxpb=args.cxpb,
+                         mutpb=args.mutpb, fitness_weights=tuple(args.fitness_weights))
+    for fmt in args.formats:
+        scenario = f"{fmt.upper() if fmt == 'png' else 'WebP'} Recovery"
+        logging.info(f"Running GA-AC with {fmt}...")
+        recovered, rows = [], []
+        for i, (path, _) in enumerate(samples):
+            start = time.perf_counter()
+            params, image, scores = run_ga(model, originals[i], images["Adversarial"][i], int(labels[i]),
+                                           fmt, device, ga_config)
+            recovered.append(image)
+            rows.append({"image": path, "label": CLASSES[labels[i]], **params, **scores,
+                         "seconds": time.perf_counter() - start})
+            if (i + 1) % 50 == 0 or i + 1 == len(samples):
+                logging.info(f"  {i + 1}/{len(samples)} images")
+        images[scenario] = np.stack(recovered)
+        with open(os.path.join(args.out, f"recovery_params_{fmt}.csv"), "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
 
-    # Image recovery
-    images_recovered = [apply_compression(img, best_config) for img in images_adv]
+    metrics = {}
+    for scenario, scenario_images in images.items():
+        preds = predict_proba(model, scenario_images, device).argmax(1)
+        metrics[scenario] = compute_metrics(labels, preds)
+        slug = scenario.lower().replace(" ", "_")
+        save_confusion_matrix(labels, preds, scenario, os.path.join(args.out, f"confusion_matrix_{slug}.pdf"))
+        logging.info(f"{scenario}: " + ", ".join(f"{k} {v:.4f}" for k, v in metrics[scenario].items()))
 
-    # Assessment after recovery
-    logging.info("Avaliando modelo após recuperação...")
-    preds_after_recovery, _ = evaluate_model(model, images_recovered)
+    with open(os.path.join(args.out, "metrics.json"), "w") as f:
+        json.dump({"config": vars(args), "metrics": metrics}, f, indent=2)
+    save_examples(images, labels, os.path.join(args.out, "examples.png"))
+    logging.info(f"Results saved to {args.out}/")
 
-    # Confusion matrix
-    cm_before = confusion_matrix(labels, preds_before)
-    cm_after = confusion_matrix(labels, preds_after_recovery)
-
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
-    ConfusionMatrixDisplay(cm_before).plot(ax=ax[0], cmap="Blues")
-    ConfusionMatrixDisplay(cm_after).plot(ax=ax[1], cmap="Greens")
-    ax[0].set_title("Antes do Ataque")
-    ax[1].set_title("Após a Recuperação")
-    plt.show()
 
 if __name__ == "__main__":
     main()

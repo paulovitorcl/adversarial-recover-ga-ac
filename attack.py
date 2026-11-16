@@ -1,27 +1,16 @@
+import torch.nn.functional as F
 import torch
-import torch.nn as nn
 
-# Function of FGSM adversarial attack
-def fgsm_attack(model, image, label, epsilon=0.03):
+
+def fgsm_attack(model, images, labels, epsilon=0.03):
+    """FGSM (Goodfellow et al., 2015).
+
+    images: (N, 1, H, W) tensor in [0, 1] pixel space, so epsilon=0.03 is ~7.7 gray levels.
+    Returns the adversarial images, clamped to [0, 1].
+    """
     model.eval()
-
-    if image.ndim == 5:
-        image = image.squeeze(0)  
-
-    image.requires_grad = True
-
-    # Forward pass
-    output = model(image) 
-    loss = nn.CrossEntropyLoss()(output, label)
-
-    
-    model.zero_grad()
-    loss.backward()
-
-    perturbation = epsilon * image.grad.sign()
-
-    adversarial_image = image + perturbation
-
-    adversarial_image = torch.clamp(adversarial_image, 0, 1)
-
-    return adversarial_image.detach()  # Remove o gradiente da imagem adversarial
+    images = images.clone().detach().requires_grad_(True)
+    loss = F.cross_entropy(model(images), labels)
+    (grad,) = torch.autograd.grad(loss, images)
+    adversarial = images + epsilon * grad.sign()
+    return adversarial.clamp(0, 1).detach()

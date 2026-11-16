@@ -1,0 +1,14 @@
+# Dataset (download from Kaggle, see README)
+chest_xray/
+*.zip
+__MACOSX/
+
+# Experiment outputs
+results/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+.DS_Store
